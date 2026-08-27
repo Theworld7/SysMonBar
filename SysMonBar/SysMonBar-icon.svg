@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3a3a3c"/>
+      <stop offset="55%" stop-color="#242426"/>
+      <stop offset="100%" stop-color="#141416"/>
+    </linearGradient>
+    <linearGradient id="chip" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#c7c7cc"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- 圆角方形背景 -->
+  <rect x="5" y="5" width="90" height="90" rx="22.5" fill="url(#bg)"/>
+
+  <!-- 顶部高光 -->
+  <rect x="5" y="5" width="90" height="45" rx="22.5" fill="#ffffff" opacity="0.04"/>
+
+  <!-- 芯片图形组 -->
+  <g filter="url(#glow)">
+    <!-- 上方引脚 -->
+    <line x1="38" y1="23" x2="38" y2="32" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <line x1="50" y1="23" x2="50" y2="32" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <line x1="62" y1="23" x2="62" y2="32" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <!-- 下方引脚 -->
+    <line x1="38" y1="68" x2="38" y2="77" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <line x1="50" y1="68" x2="50" y2="77" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <line x1="62" y1="68" x2="62" y2="77" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <!-- 左侧引脚 -->
+    <line x1="23" y1="38" x2="32" y2="38" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <line x1="23" y1="50" x2="32" y2="50" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <line x1="23" y1="62" x2="32" y2="62" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <!-- 右侧引脚 -->
+    <line x1="68" y1="38" x2="77" y2="38" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <line x1="68" y1="50" x2="77" y2="50" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <line x1="68" y1="62" x2="77" y2="62" stroke="url(#chip)" stroke-width="4.5" stroke-linecap="round"/>
+    <!-- 芯片外框 -->
+    <rect x="32" y="32" width="36" height="36" rx="7.5" fill="none" stroke="url(#chip)" stroke-width="5" stroke-linejoin="round"/>
+    <!-- 芯片内核 -->
+    <rect x="42" y="42" width="16" height="16" rx="3.5" fill="url(#chip)"/>
+  </g>
+</svg>

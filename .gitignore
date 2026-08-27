@@ -1,0 +1,40 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/xcschemes/
+*.xcuserdatad/xcdebugger/
+
+# 排除 xcodeproj 内部 user data（保留 schemes 文件夹结构，但忽略本地状态）
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 发布产物（用 build.sh 重新生成）
+*.zip
+*.dmg
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# AI 编辑器 / 助手临时文件
+.claude/
+.cursor/
+.aider*
+.cody/
+.continue/
+.windsurf/
+.codeium/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+*.copilot*
