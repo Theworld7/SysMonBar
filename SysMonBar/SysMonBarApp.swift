@@ -9,7 +9,7 @@ import Combine
 import Darwin
 import os.log
 
-private let log = OSLog(subsystem: "com.xiongfei.sysmonbar", category: "tick")
+private let log = OSLog(subsystem: "com.theworld7.sysmonbar", category: "tick")
 
 // MARK: - 数据模型
 
@@ -441,9 +441,21 @@ struct SysMonBarApp: App {
     @StateObject private var monitor: SystemMonitor
 
     init() {
+        // 双保险：除了 LSUIElement，运行时再设一次 accessory 激活策略
+        // 防止 macOS Sonoma+ 在某些场景下把它当 regular app 处理
+        NSApp.setActivationPolicy(.accessory)
         let m = SystemMonitor()
         m.start()
         _monitor = StateObject(wrappedValue: m)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        os_log("app did finish launching", log: log, type: .info)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        os_log("app will terminate", log: log, type: .info)
+        monitor.stop()
     }
 
     var body: some Scene {
