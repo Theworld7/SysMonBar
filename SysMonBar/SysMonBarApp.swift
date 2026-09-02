@@ -373,6 +373,7 @@ struct NetSparkline: View {
 struct MenuContentView: View {
     @EnvironmentObject var monitor: SystemMonitor
     @EnvironmentObject var quotas: QuotaCoordinator
+    @EnvironmentObject var settings: StatusBarSettings
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -404,7 +405,20 @@ struct MenuContentView: View {
 
             Divider()
 
-            aiQuotaSection
+            // AI Provider：开关关闭的厂商不展示
+            if settings.showDeepSeek {
+                aiQuotaSection
+            }
+            if settings.showMiniMax {
+                miniMaxSection
+            }
+            // 统一的刷新 + 配置（刷新两个厂商；配置打开 AI Provider 面板）
+            HStack(spacing: 6) {
+                Button("刷新") { Task { await quotas.refreshAll() } }
+                    .disabled(quotas.isLoading)
+                Button("配置") { NotificationCenter.default.post(name: .showAIProviderConfig, object: nil) }
+            }
+            .controlSize(.small)
 
             Divider()
             HStack {
@@ -444,80 +458,112 @@ struct MenuContentView: View {
         return .green
     }
 
+    /// 通用 provider 面板 section（图标+名称+进度条/余额+时间；按键统一由面板提供）
     @ViewBuilder
-    private var aiQuotaSection: some View {
-        HStack(alignment: .center) {
-            // 左：图标 + 名称 + 余额，更新时间 / 错误在下方
-            VStack(alignment: .leading, spacing: 2) {
+    private func providerSection(_ provider: any ProviderQuota) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
-                    Image(systemName: "creditcard")
+                    Image(systemName: provider.icon)
                         .foregroundStyle(.secondary)
                         .frame(width: 20, alignment: .leading)
-                    Text("DeepSeek")
-                    if quotas.deepSeek.isAuthenticated {
-                        if let bal = quotas.deepSeek.balance {
-                            Text(verbatim: "\(quotas.deepSeek.currencySymbol)\(bal)")
+                    Text(provider.displayName)
+                    // 有 progressSegments 时不显示文本余额（进度条替代）
+                    if provider.progressSegments.isEmpty {
+                        if provider.isAuthenticated, let bal = provider.balance {
+                            Text(verbatim: provider.formatted(bal))
                                 .font(.system(.body, design: .monospaced))
-                                .foregroundStyle(quotas.summaryColor)
+                                .foregroundStyle(provider.summaryColor)
                                 .fixedSize(horizontal: true, vertical: false)
-                        } else if quotas.deepSeek.isLoading {
+                        } else if provider.isLoading {
                             ProgressView().controlSize(.small)
-                        } else {
-                            Text("—").foregroundStyle(.secondary)
+                        } else if !provider.isAuthenticated {
+                            Text("未设置 Key").foregroundStyle(.secondary)
                         }
-                    } else {
-                        Text("未设置 Key").foregroundStyle(.secondary)
                     }
                 }
-                if let updated = quotas.deepSeek.lastUpdated {
+                // 进度条分段（MiniMax：5h + 周限额）
+                ForEach(Array(provider.progressSegments.enumerated()), id: \.offset) { _, seg in
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack {
+                            Text(seg.label)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(Int(seg.percent * 100))%")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        ProgressView(value: seg.percent)
+                            .progressViewStyle(.linear)
+                            .tint(seg.percent > 0.5 ? Color.green : (seg.percent > 0.2 ? Color.orange : Color.red))
+                    }
+                }
+                // 无进度条时才显示副余额文本
+                if provider.progressSegments.isEmpty, let secondary = provider.secondaryBalance {
+                    Text("周剩余: \(provider.formatted(secondary))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let updated = provider.lastUpdated {
                     Text("更新于 \(updated.formatted(.relative(presentation: .named)))")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-                if let err = quotas.deepSeek.lastError {
+                if let err = provider.lastError {
                     Text(err)
                         .font(.caption2)
                         .foregroundStyle(.red)
                 }
             }
-            Spacer()
-            // 右：刷新 / 退出登录（横向并排，靠右对齐）
-            HStack(spacing: 6) {
-                if quotas.deepSeek.isAuthenticated {
-                    Button("刷新") {
-                        Task { await quotas.deepSeek.refresh() }
-                    }
-                    .disabled(quotas.deepSeek.isLoading)
-                    Button("修改 Key") {
-                        quotas.deepSeek.signOut()
-                    }
-                } else {
-                    Button("设置 API Key") {
-                        Task { await quotas.deepSeek.signIn() }
-                    }
-                }
-            }
-            .controlSize(.small)
-        }
+    }
+
+    private var aiQuotaSection: some View {
+        providerSection(quotas.deepSeek)
+    }
+
+    private var miniMaxSection: some View {
+        providerSection(quotas.miniMax)
     }
 }
 
 // MARK: - AI 订阅额度
 
+/// 进度条分段（label + 0.0-1.0 的百分比），provider 自带的多条进度条
+struct ProviderProgressSegment {
+    let label: String
+    let percent: Double
+}
+
 protocol ProviderQuota: ObservableObject {
     var name: String { get }
     var displayName: String { get }
+    var icon: String { get }
     var currencySymbol: String { get }
     var balance: Decimal? { get }
+    /// 副余额（如 MiniMax 的周限额），默认 nil
+    var secondaryBalance: Decimal? { get }
     var lastUpdated: Date? { get }
     var isAuthenticated: Bool { get }
     var lastError: String? { get }
     var isLoading: Bool { get }
+    var summaryColor: Color { get }
+    /// 进度条分段（默认空；MiniMax 暴露 5h/周两条）
+    var progressSegments: [ProviderProgressSegment] { get }
     func start()
     func stop()
     func refresh() async
     func signIn() async
     func signOut()
+    /// 余额格式化（默认符号在前如 ¥110；MiniMax 覆盖为符号在后如 13%）
+    func formatted(_ amount: Decimal) -> String
+}
+
+extension ProviderQuota {
+    var secondaryBalance: Decimal? { nil }
+    var progressSegments: [ProviderProgressSegment] { [] }
+    func formatted(_ amount: Decimal) -> String {
+        "\(currencySymbol)\(amount)"
+    }
 }
 
 // MARK: - SQLite 配置存储
@@ -604,8 +650,7 @@ struct SQLiteStore {
     }
 }
 
-/// DeepSeek API Key 持久化（SQLite 后端；API 与之前的 Keychain 版一致，
-/// 所以 DeepSeekProvider 完全不用改）
+/// DeepSeek API Key 持久化（SQLite 后端）
 struct DeepSeekAPIKeyStore {
     private static let db = SQLiteStore()
     private static let rowKey = "deepseek_api_key"
@@ -621,6 +666,16 @@ struct DeepSeekAPIKeyStore {
     func clear() {
         Self.db.delete(Self.rowKey)
     }
+}
+
+/// MiniMax API Key 持久化（SQLite 后端）
+struct MiniMaxAPIKeyStore {
+    private static let db = SQLiteStore()
+    private static let rowKey = "minimax_api_key"
+
+    func load() -> String? { Self.db.load(Self.rowKey) }
+    func save(_ value: String) { Self.db.save(Self.rowKey, value: value) }
+    func clear() { Self.db.delete(Self.rowKey) }
 }
 
 // MARK: - DeepSeek 官方余额 API
@@ -661,6 +716,42 @@ struct DeepSeekBalance: Decodable {
     }
 }
 
+/// MiniMax GET /v1/token_plan/remains 真实返回结构
+/// base_resp 包含业务状态（status_code == 0 才算成功），model_remains 是各模型限额
+struct MiniMaxBalance: Decodable {
+    let modelRemains: [ModelRemain]
+    let baseResp: BaseResp
+
+    enum CodingKeys: String, CodingKey {
+        case modelRemains = "model_remains"
+        case baseResp = "base_resp"
+    }
+
+    struct BaseResp: Decodable {
+        let statusCode: Int
+        let statusMsg: String
+
+        enum CodingKeys: String, CodingKey {
+            case statusCode = "status_code"
+            case statusMsg = "status_msg"
+        }
+
+        var isSuccess: Bool { statusCode == 0 }
+    }
+
+    struct ModelRemain: Decodable {
+        let currentIntervalRemainingPercent: Int   // 5h 已使用百分比 0-100（接口实为已用额度）
+        let currentWeeklyRemainingPercent: Int     // 周已使用百分比 0-100
+        let modelName: String?
+
+        enum CodingKeys: String, CodingKey {
+            case currentIntervalRemainingPercent = "current_interval_remaining_percent"
+            case currentWeeklyRemainingPercent = "current_weekly_remaining_percent"
+            case modelName = "model_name"
+        }
+    }
+}
+
 private extension KeyedDecodingContainer {
     /// 兼容 API 用字符串（"110.00"）或数字（110.0）返回金额。
     func flexibleDecimal(forKey key: Key) throws -> Decimal {
@@ -673,19 +764,24 @@ private extension KeyedDecodingContainer {
 }
 
 @MainActor
-enum DeepSeekAPIKeyInput {
-    /// 弹窗输入 DeepSeek API Key，回调传入清洗后的字符串。
-    static func present(onSubmit: @escaping (String?) -> Void) {
+enum APIKeyInputAlert {
+    /// 通用 API Key 输入弹窗。messageText 为标题，informativeText 为说明。
+    static func present(
+        messageText: String,
+        informativeText: String = "余额将通过官方接口查询。",
+        placeholder: String = "sk-...",
+        onSubmit: @escaping (String?) -> Void
+    ) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "设置 DeepSeek API Key"
-        alert.informativeText = "在 platform.deepseek.com 的 \"API Keys\" 页面生成密钥。余额将通过官方 /user/balance 接口查询。"
+        alert.messageText = messageText
+        alert.informativeText = informativeText
         alert.alertStyle = .informational
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
 
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "sk-..."
+        field.placeholderString = placeholder
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
 
@@ -701,8 +797,18 @@ enum DeepSeekAPIKeyInput {
 final class DeepSeekProvider: ObservableObject, ProviderQuota {
     let name = "DeepSeek"
     let displayName = "DeepSeek"
+    let icon = "creditcard"
     var currencySymbol: String { currency == "USD" ? "$" : "¥" }
     @Published private(set) var currency = "CNY"
+
+    /// >¥100 绿、¥20–100 橙、<¥20 红
+    var summaryColor: Color {
+        guard let bal = balance else { return .secondary }
+        let n = NSDecimalNumber(decimal: bal).doubleValue
+        if n > 100 { return .green }
+        if n > 20 { return .orange }
+        return .red
+    }
 
     @Published private(set) var balance: Decimal?
     @Published private(set) var isAvailable = false
@@ -813,7 +919,10 @@ final class DeepSeekProvider: ObservableObject, ProviderQuota {
     }
 
     func signIn() async {
-        DeepSeekAPIKeyInput.present { [weak self] key in
+        APIKeyInputAlert.present(
+            messageText: "设置 DeepSeek API Key",
+            informativeText: "在 platform.deepseek.com 的 \"API Keys\" 页面生成密钥。余额将通过官方 /user/balance 接口查询。"
+        ) { [weak self] key in
             guard let self, let key, !key.isEmpty else { return }
             self.store.save(key)
             self.cachedAPIKey = key
@@ -833,17 +942,202 @@ final class DeepSeekProvider: ObservableObject, ProviderQuota {
         lastUpdated = nil
         lastError = nil
     }
+
+    /// 当前已保存的 API Key（用于配置界面回填）
+    var storedAPIKey: String? { store.load() }
+
+    /// 直接保存 API Key（配置界面输入框使用），不弹窗
+    func saveAPIKey(_ key: String) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        store.save(trimmed)
+        cachedAPIKey = trimmed
+        isAuthenticated = true
+        lastError = nil
+        Task { await refresh() }
+    }
+}
+
+@MainActor
+final class MiniMaxProvider: ObservableObject, ProviderQuota {
+    let name = "MiniMax"
+    let displayName = "MiniMax"
+    let icon = "bolt"
+    let currencySymbol = "%"
+
+    /// 剩余百分比：>50 绿、>20 橙、其余红
+    var summaryColor: Color {
+        guard let bal = balance else { return .secondary }
+        let n = NSDecimalNumber(decimal: bal).doubleValue
+        if n > 50 { return .green }
+        if n > 20 { return .orange }
+        return .red
+    }
+
+    /// 百分比符号在后：「13%」
+    func formatted(_ amount: Decimal) -> String {
+        "\(amount)\(currencySymbol)"
+    }
+
+    /// 5h / 周剩余百分比的进度条（接口返回已用额度，这里换算成剩余显示）
+    var progressSegments: [ProviderProgressSegment] {
+        guard let b5h = balance, let bw = secondaryBalance else { return [] }
+        return [
+            ProviderProgressSegment(label: "5h 剩余", percent: NSDecimalNumber(decimal: b5h).doubleValue / 100.0),
+            ProviderProgressSegment(label: "周剩余", percent: NSDecimalNumber(decimal: bw).doubleValue / 100.0),
+        ]
+    }
+
+    @Published private(set) var balance: Decimal?
+    /// 周剩余百分比（副余额）
+    @Published private(set) var weeklyBalance: Decimal?
+    @Published private(set) var lastUpdated: Date?
+    @Published private(set) var isAuthenticated = false
+    @Published private(set) var lastError: String?
+    @Published private(set) var isLoading = false
+
+    private var cachedAPIKey: String?
+    private let store = MiniMaxAPIKeyStore()
+    private var timer: Timer?
+    private let refreshInterval: TimeInterval = 300
+    private let apiURL = URL(string: "https://api.minimaxi.com/v1/token_plan/remains")!
+
+    init() {}
+
+    private func syncAuthFromStore() {
+        let key = store.load()
+        cachedAPIKey = key
+        let has = key?.isEmpty == false
+        if isAuthenticated != has { isAuthenticated = has }
+    }
+
+    func start() {
+        syncAuthFromStore()
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in await self?.refresh() }
+        }
+        Task { await refresh() }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func refresh() async {
+        isLoading = true
+        defer { isLoading = false }
+
+        let key: String
+        if let cached = cachedAPIKey, !cached.isEmpty {
+            key = cached
+        } else if let loaded = store.load(), !loaded.isEmpty {
+            cachedAPIKey = loaded
+            key = loaded
+        } else {
+            if isAuthenticated { isAuthenticated = false }
+            lastError = "未设置 API Key，请先设置密钥"
+            return
+        }
+        if !isAuthenticated { isAuthenticated = true }
+
+        var req = URLRequest(url: apiURL)
+        req.httpMethod = "GET"
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                lastError = "无效响应"
+                return
+            }
+            if http.statusCode == 401 {
+                isAuthenticated = false
+                lastError = "API Key 无效，请重新设置"
+                store.clear()
+                cachedAPIKey = nil
+                return
+            }
+            guard http.statusCode == 200 else {
+                lastError = "HTTP \(http.statusCode)"
+                return
+            }
+
+            do {
+                let payload = try JSONDecoder().decode(MiniMaxBalance.self, from: data)
+                guard payload.baseResp.isSuccess else {
+                    lastError = "API: \(payload.baseResp.statusMsg)"
+                    return
+                }
+                // 接口返回的是已使用额度，换算成剩余额度显示（100 - 已用）
+                balance = payload.modelRemains.first.map { Decimal(100 - $0.currentIntervalRemainingPercent) } ?? 0
+                weeklyBalance = payload.modelRemains.first.map { Decimal(100 - $0.currentWeeklyRemainingPercent) } ?? 0
+                lastUpdated = Date()
+                lastError = nil
+            } catch {
+                lastError = "解析余额失败：\(error.localizedDescription)"
+            }
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// 周剩余百分比作为副余额展示
+    var secondaryBalance: Decimal? { weeklyBalance }
+
+    func signIn() async {
+        APIKeyInputAlert.present(
+            messageText: "设置 MiniMax API Key",
+            informativeText: "在 platform.MiniMax.io 的 API Keys 页面生成密钥。余额将通过 /v1/token_plan/remains 接口查询。"
+        ) { [weak self] key in
+            guard let self, let key, !key.isEmpty else { return }
+            self.store.save(key)
+            self.cachedAPIKey = key
+            self.isAuthenticated = true
+            self.lastError = nil
+            Task { await self.refresh() }
+        }
+    }
+
+    func signOut() {
+        store.clear()
+        cachedAPIKey = nil
+        isAuthenticated = false
+        balance = nil
+        weeklyBalance = nil
+        lastUpdated = nil
+        lastError = nil
+    }
+
+    /// 当前已保存的 API Key（用于配置界面回填）
+    var storedAPIKey: String? { store.load() }
+
+    /// 直接保存 API Key（配置界面输入框使用），不弹窗
+    func saveAPIKey(_ key: String) {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        store.save(trimmed)
+        cachedAPIKey = trimmed
+        isAuthenticated = true
+        lastError = nil
+        Task { await refresh() }
+    }
 }
 
 @MainActor
 final class QuotaCoordinator: ObservableObject {
     let providers: [any ProviderQuota]
     let deepSeek: DeepSeekProvider
+    let miniMax: MiniMaxProvider
 
     init() {
         let ds = DeepSeekProvider()
+        let mm = MiniMaxProvider()
         self.deepSeek = ds
-        self.providers = [ds]
+        self.miniMax = mm
+        self.providers = [ds, mm]
     }
 
     func start() {
@@ -854,21 +1148,25 @@ final class QuotaCoordinator: ObservableObject {
         for p in providers { p.stop() }
     }
 
+    /// 任一厂商是否正在加载（用于禁用“刷新”按钮）
+    var isLoading: Bool {
+        providers.contains { $0.isLoading }
+    }
+
+    /// 一次刷新所有厂商（DeepSeek + MiniMax）
+    func refreshAll() async {
+        await deepSeek.refresh()
+        await miniMax.refresh()
+    }
+
     /// 菜单栏展示用的简短文本（已登录且有余额时才有意义）
     var summary: String {
         guard let bal = deepSeek.balance else { return "—" }
         return "\(deepSeek.currencySymbol)\(bal)"
     }
 
-    /// 按绝对余额分级：>¥100 绿、¥20–100 橙、<¥20 红
-    /// TODO: 用户可按偏好调阈值
-    var summaryColor: Color {
-        guard let bal = deepSeek.balance else { return .secondary }
-        let n = NSDecimalNumber(decimal: bal).doubleValue
-        if n > 100 { return .green }
-        if n > 20 { return .orange }
-        return .red
-    }
+    /// 菜单栏用的颜色（兼容旧引用，委托给 deepSeek）
+    var summaryColor: Color { deepSeek.summaryColor }
 }
 
 // MARK: - App 入口
@@ -880,6 +1178,7 @@ final class StatusBarSettings: ObservableObject {
     @Published var showMemory: Bool   { didSet { store.setBool("statusbar.show_memory", showMemory) } }
     @Published var showDisk: Bool     { didSet { store.setBool("statusbar.show_disk", showDisk) } }
     @Published var showDeepSeek: Bool { didSet { store.setBool("statusbar.show_deepseek", showDeepSeek) } }
+    @Published var showMiniMax: Bool  { didSet { store.setBool("statusbar.show_minimax", showMiniMax) } }
 
     private let store = SQLiteStore()
 
@@ -888,6 +1187,7 @@ final class StatusBarSettings: ObservableObject {
         showMemory   = store.getBool("statusbar.show_memory", default: true)
         showDisk     = store.getBool("statusbar.show_disk", default: true)
         showDeepSeek = store.getBool("statusbar.show_deepseek", default: true)
+        showMiniMax  = store.getBool("statusbar.show_minimax", default: true)
     }
 }
 
@@ -901,11 +1201,110 @@ struct SettingsView: View {
                 Toggle("内存", isOn: $settings.showMemory)
                 Toggle("磁盘", isOn: $settings.showDisk)
                 Toggle("DeepSeek 余额", isOn: $settings.showDeepSeek)
+                Toggle("MiniMax 余额", isOn: $settings.showMiniMax)
             }
         }
         .formStyle(.grouped)
         .frame(width: 360)
         .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// AI Provider 配置面板（独立窗口）：每个厂商一行（名称 + Switch 开关），
+/// 打开后展示 API Key 输入框。关闭开关只隐藏展示，不删除已保存的 Key。
+/// 通过“保存/取消”统一提交，避免边改边生效。
+struct AIProviderConfigView: View {
+    let settings: StatusBarSettings
+    let deepSeek: DeepSeekProvider
+    let miniMax: MiniMaxProvider
+    let onSave: () -> Void
+    let onCancel: () -> Void
+    @State private var dsEnabled: Bool
+    @State private var mmEnabled: Bool
+    @State private var dsKey: String
+    @State private var mmKey: String
+
+    init(
+        settings: StatusBarSettings,
+        deepSeek: DeepSeekProvider,
+        miniMax: MiniMaxProvider,
+        onSave: @escaping () -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        self.settings = settings
+        self.deepSeek = deepSeek
+        self.miniMax = miniMax
+        self.onSave = onSave
+        self.onCancel = onCancel
+        _dsEnabled = State(initialValue: settings.showDeepSeek)
+        _mmEnabled = State(initialValue: settings.showMiniMax)
+        _dsKey = State(initialValue: deepSeek.storedAPIKey ?? "")
+        _mmKey = State(initialValue: miniMax.storedAPIKey ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("AI Provider 配置")
+                .font(.headline)
+
+            providerRow(title: "DeepSeek", enabled: $dsEnabled, key: $dsKey,
+                        placeholder: "DeepSeek API Key (sk-...)")
+
+            Divider()
+
+            providerRow(title: "MiniMax", enabled: $mmEnabled, key: $mmKey,
+                        placeholder: "MiniMax API Key (sk-...)")
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Spacer()
+                Button("取消") { onCancel() }
+                    .keyboardShortcut(.cancelAction)
+                Button("保存") { apply(); onSave() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .controlSize(.small)
+        }
+        .padding()
+        .frame(width: 400)
+    }
+
+    @ViewBuilder
+    private func providerRow(
+        title: String,
+        enabled: Binding<Bool>,
+        key: Binding<String>,
+        placeholder: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title)
+                Spacer()
+                Toggle("", isOn: enabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+            }
+            if enabled.wrappedValue {
+                TextField(placeholder, text: key)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    /// 统一提交：应用到显示开关 + 保存各厂商 Key（仅对打开的厂商写入）
+    private func apply() {
+        settings.showDeepSeek = dsEnabled
+        settings.showMiniMax = mmEnabled
+        if dsEnabled {
+            let dk = dsKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !dk.isEmpty { deepSeek.saveAPIKey(dk) }
+        }
+        if mmEnabled {
+            let mk = mmKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !mk.isEmpty { miniMax.saveAPIKey(mk) }
+        }
     }
 }
 
@@ -946,11 +1345,18 @@ struct StatusBarLabel: View {
                     .foregroundStyle(.secondary)
             }
 
-            if settings.showDeepSeek && quotas.deepSeek.isAuthenticated {
-                Image(systemName: "creditcard.fill")
-                    .foregroundStyle(quotas.summaryColor)
-                Text(quotas.summary)
-                    .foregroundStyle(quotas.summaryColor)
+            if settings.showDeepSeek && quotas.deepSeek.isAuthenticated, let bal = quotas.deepSeek.balance {
+                Image(systemName: quotas.deepSeek.icon + ".fill")
+                    .foregroundStyle(quotas.deepSeek.summaryColor)
+                Text(quotas.deepSeek.formatted(bal))
+                    .foregroundStyle(quotas.deepSeek.summaryColor)
+            }
+
+            if settings.showMiniMax && quotas.miniMax.isAuthenticated, let bal = quotas.miniMax.balance {
+                Image(systemName: quotas.miniMax.icon + ".fill")
+                    .foregroundStyle(quotas.miniMax.summaryColor)
+                Text(quotas.miniMax.formatted(bal))
+                    .foregroundStyle(quotas.miniMax.summaryColor)
             }
         }
         .font(.system(size: 11, weight: .medium))
@@ -965,10 +1371,12 @@ struct StatusBarLabel: View {
 final class PanelViewController: NSViewController {
     let monitor: SystemMonitor
     let quotas: QuotaCoordinator
+    let settings: StatusBarSettings
 
-    init(monitor: SystemMonitor, quotas: QuotaCoordinator) {
+    init(monitor: SystemMonitor, quotas: QuotaCoordinator, settings: StatusBarSettings) {
         self.monitor = monitor
         self.quotas = quotas
+        self.settings = settings
         super.init(nibName: nil, bundle: nil)
         self.preferredContentSize = NSSize(width: 360, height: 400)
     }
@@ -986,6 +1394,7 @@ final class PanelViewController: NSViewController {
             MenuContentView()
                 .environmentObject(monitor)
                 .environmentObject(quotas)
+                .environmentObject(settings)
                 .frame(width: 360)
         )
         hosting.translatesAutoresizingMaskIntoConstraints = false
@@ -1011,14 +1420,21 @@ final class PanelViewController: NSViewController {
     }
 }
 
+extension Notification.Name {
+    static let showAIProviderConfig = Notification.Name("showAIProviderConfig")
+}
+
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let state = AppState()
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
+    private var configWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         os_log("app did finish launching", log: log, type: .info)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleShowProviderConfig(_:)),
+                                               name: .showAIProviderConfig, object: nil)
         setupStatusItemAndPopover()
     }
 
@@ -1053,7 +1469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pop.behavior = .transient
         pop.contentSize = NSSize(width: 360, height: 400)
         pop.contentViewController = PanelViewController(
-            monitor: state.monitor, quotas: state.quotas
+            monitor: state.monitor, quotas: state.quotas, settings: state.settings
         )
 
         self.statusItem = item
@@ -1067,6 +1483,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
+    }
+
+    // MARK: - AI Provider 配置窗口
+    @objc private func handleShowProviderConfig(_ note: Notification) {
+        showProviderConfig()
+    }
+
+    /// 打开/聚焦 AI Provider 配置窗口（独立窗口，可统一保存/取消）
+    func showProviderConfig() {
+        if let win = configWindow {
+            win.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "AI Provider 配置"
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+
+        let content = AIProviderConfigView(
+            settings: state.settings,
+            deepSeek: state.quotas.deepSeek,
+            miniMax: state.quotas.miniMax,
+            onSave: { [weak self] in self?.closeProviderConfig() },
+            onCancel: { [weak self] in self?.closeProviderConfig() }
+        )
+        let hosting = NSHostingView(rootView: content)
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        let container = NSView()
+        container.addSubview(hosting)
+        NSLayoutConstraint.activate([
+            hosting.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            hosting.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            hosting.topAnchor.constraint(equalTo: container.topAnchor),
+            hosting.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        win.contentView = container
+        win.center()
+
+        self.configWindow = win
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func closeProviderConfig() {
+        configWindow?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let win = notification.object as? NSWindow, win === configWindow else { return }
+        configWindow = nil
     }
 }
 
