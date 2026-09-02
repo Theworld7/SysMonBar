@@ -6,6 +6,7 @@
 
 import SwiftUI
 import Combine
+import AppKit
 import Darwin
 import SQLite3
 import os.log
@@ -415,7 +416,7 @@ struct MenuContentView: View {
             }
         }
         .padding(14)
-        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12))
+        .glassEffect(.clear, in: RoundedRectangle(cornerRadius: 20))
     }
 
     private func metricRow(icon: String, title: String, pct: Double, detail: String) -> some View {
@@ -860,67 +861,167 @@ final class QuotaCoordinator: ObservableObject {
 
 // MARK: - App 入口
 
-@main
-struct SysMonBarApp: App {
-    @StateObject private var monitor: SystemMonitor
-    @StateObject private var quotas: QuotaCoordinator
+// 共享全局状态：App 与 AppDelegate 都需要访问 monitor / quotas
+@MainActor
+final class AppState {
+    let monitor = SystemMonitor()
+    let quotas = QuotaCoordinator()
+    init() { monitor.start(); quotas.start() }
+}
 
-    init() {
-        // LSUIElement=true 已在 Info.plist 设置，SwiftUI 会自动用 accessory 激活策略。
-        // 不在这里调 NSApp.setActivationPolicy(.accessory)：在 SwiftUI App.init() 里
-        // NSApp 全局变量可能还是 nil（macOS 27 SDK 行为变了），访问会 force unwrap crash。
-        let m = SystemMonitor()
-        m.start()
-        let q = QuotaCoordinator()
-        q.start()
-        _monitor = StateObject(wrappedValue: m)
-        _quotas = StateObject(wrappedValue: q)
+// 状态栏标签（原 MenuBarExtra label 抽出，方便 NSHostingView 托管）
+struct StatusBarLabel: View {
+    @ObservedObject var monitor: SystemMonitor
+    @ObservedObject var quotas: QuotaCoordinator
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "cpu")
+                .foregroundStyle(monitor.cpuColor)
+            Text("\(Int(monitor.snapshot.cpuUsage * 100))%")
+                .foregroundStyle(monitor.cpuColor)
+
+            Image(systemName: "memorychip")
+                .foregroundStyle(.secondary)
+            Text("\(Int(monitor.snapshot.memUsedGB))/\(Int(monitor.snapshot.memTotalGB))G")
+                .foregroundStyle(.secondary)
+
+            Image(systemName: "internaldrive")
+                .foregroundStyle(.secondary)
+            Text("\(Int(monitor.snapshot.diskPct * 100))%")
+                .foregroundStyle(.secondary)
+
+            if quotas.deepSeek.isAuthenticated {
+                Image(systemName: "creditcard.fill")
+                    .foregroundStyle(quotas.summaryColor)
+                Text(quotas.summary)
+                    .foregroundStyle(quotas.summaryColor)
+            }
+        }
+        .font(.system(size: 11, weight: .medium))
+        .monospacedDigit()
+        .fixedSize()
+    }
+}
+
+// 弹窗视图控制器：根视图是 NSGlassEffectView（系统 Liquid Glass 容器），
+// 内容用 NSHostingView 托管 SwiftUI 面板。这样系统「外观→Liquid Glass」滑块
+// 能直接作用在 NSGlassEffectView 上，不受 NSHostingView 限制。
+final class PanelViewController: NSViewController {
+    let monitor: SystemMonitor
+    let quotas: QuotaCoordinator
+
+    init(monitor: SystemMonitor, quotas: QuotaCoordinator) {
+        self.monitor = monitor
+        self.quotas = quotas
+        super.init(nibName: nil, bundle: nil)
+        self.preferredContentSize = NSSize(width: 360, height: 400)
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        os_log("app did finish launching", log: log, type: .info)
-    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        os_log("app will terminate", log: log, type: .info)
-        monitor.stop()
-        quotas.stop()
-    }
+    override func loadView() {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.clear.cgColor
+        self.view = container
 
-    var body: some Scene {
-        MenuBarExtra {
+        let hosting = NSHostingView(rootView:
             MenuContentView()
                 .environmentObject(monitor)
                 .environmentObject(quotas)
                 .frame(width: 360)
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "cpu")
-                    .foregroundStyle(monitor.cpuColor)
-                Text("\(Int(monitor.snapshot.cpuUsage * 100))%")
-                    .foregroundStyle(monitor.cpuColor)
+        )
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = NSColor.clear.cgColor
+        container.addSubview(hosting)
+        NSLayoutConstraint.activate([
+            hosting.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            hosting.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            hosting.topAnchor.constraint(equalTo: container.topAnchor),
+            hosting.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+    }
 
-                Image(systemName: "memorychip")
-                    .foregroundStyle(.secondary)
-                Text("\(Int(monitor.snapshot.memUsedGB))/\(Int(monitor.snapshot.memTotalGB))G")
-                    .foregroundStyle(.secondary)
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard let win = self.view.window else { return }
+        // NSPopover 默认会给弹窗窗口套一圈 drop shadow；控制中心风格的玻璃面板不需要
+        win.hasShadow = false
+        // 确保弹窗窗口自身透明，不挡底层玻璃的透光
+        win.backgroundColor = .clear
+        win.isOpaque = false
+    }
+}
 
-                Image(systemName: "internaldrive")
-                    .foregroundStyle(.secondary)
-                Text("\(Int(monitor.snapshot.diskPct * 100))%")
-                    .foregroundStyle(.secondary)
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let state = AppState()
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
 
-                if quotas.deepSeek.isAuthenticated {
-                    Image(systemName: "creditcard.fill")
-                        .foregroundStyle(quotas.summaryColor)
-                    Text(quotas.summary)
-                        .foregroundStyle(quotas.summaryColor)
-                }
-            }
-            .font(.system(size: 11, weight: .medium))
-            .monospacedDigit()
-            .fixedSize()
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        os_log("app did finish launching", log: log, type: .info)
+        setupStatusItemAndPopover()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        os_log("app will terminate", log: log, type: .info)
+        state.monitor.stop()
+        state.quotas.stop()
+    }
+
+    private func setupStatusItemAndPopover() {
+        // 状态栏：NSStatusItem + NSButton，button 内嵌 NSHostingView(SwiftUI 标签)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        guard let button = item.button else { return }
+
+        let label = NSHostingView(rootView:
+            StatusBarLabel(monitor: state.monitor, quotas: state.quotas)
+        )
+        label.translatesAutoresizingMaskIntoConstraints = false
+        button.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: button.leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: button.trailingAnchor),
+            label.topAnchor.constraint(equalTo: button.topAnchor),
+            label.bottomAnchor.constraint(equalTo: button.bottomAnchor),
+        ])
+
+        button.action = #selector(togglePopover(_:))
+        button.target = self
+
+        // 弹窗：NSPopover + PanelViewController（自带 NSGlassEffectView）
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentSize = NSSize(width: 360, height: 400)
+        pop.contentViewController = PanelViewController(
+            monitor: state.monitor, quotas: state.quotas
+        )
+
+        self.statusItem = item
+        self.popover = pop
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        guard let item = statusItem, let pop = popover, let button = item.button else { return }
+        if pop.isShown {
+            pop.performClose(sender)
+        } else {
+            pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
-        .menuBarExtraStyle(.window)
+    }
+}
+
+@main
+struct SysMonBarApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        // 真正的 UI 由 AppDelegate 用 NSStatusItem + NSPopover 搭建；
+        // 这里保留一个空 Settings 场景以满足 App 必须有 Scene 的要求。
+        Settings { EmptyView() }
     }
 }
