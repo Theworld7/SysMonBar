@@ -411,6 +411,9 @@ struct MenuContentView: View {
                 Text(String(format: "刷新1Hz · SysMonBar"))
                     .font(.caption2).foregroundStyle(.secondary)
                 Spacer()
+                SettingsLink {
+                    Text("设置")
+                }
                 Button("退出") { NSApp.terminate(nil) }
                     .keyboardShortcut("q")
             }
@@ -589,6 +592,15 @@ struct SQLiteStore {
                                  -1, &stmt, nil) == SQLITE_OK else { return }
         sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT_FN)
         sqlite3_step(stmt)
+    }
+
+    func getBool(_ key: String, default defaultValue: Bool) -> Bool {
+        guard let s = load(key) else { return defaultValue }
+        return s == "1"
+    }
+
+    func setBool(_ key: String, _ value: Bool) {
+        save(key, value: value ? "1" : "0")
     }
 }
 
@@ -863,9 +875,45 @@ final class QuotaCoordinator: ObservableObject {
 
 // 共享全局状态：App 与 AppDelegate 都需要访问 monitor / quotas
 @MainActor
+final class StatusBarSettings: ObservableObject {
+    @Published var showCPU: Bool      { didSet { store.setBool("statusbar.show_cpu", showCPU) } }
+    @Published var showMemory: Bool   { didSet { store.setBool("statusbar.show_memory", showMemory) } }
+    @Published var showDisk: Bool     { didSet { store.setBool("statusbar.show_disk", showDisk) } }
+    @Published var showDeepSeek: Bool { didSet { store.setBool("statusbar.show_deepseek", showDeepSeek) } }
+
+    private let store = SQLiteStore()
+
+    init() {
+        showCPU      = store.getBool("statusbar.show_cpu", default: true)
+        showMemory   = store.getBool("statusbar.show_memory", default: true)
+        showDisk     = store.getBool("statusbar.show_disk", default: true)
+        showDeepSeek = store.getBool("statusbar.show_deepseek", default: true)
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var settings: StatusBarSettings
+
+    var body: some View {
+        Form {
+            Section("状态栏显示项") {
+                Toggle("CPU 使用率", isOn: $settings.showCPU)
+                Toggle("内存", isOn: $settings.showMemory)
+                Toggle("磁盘", isOn: $settings.showDisk)
+                Toggle("DeepSeek 余额", isOn: $settings.showDeepSeek)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 360)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+@MainActor
 final class AppState {
     let monitor = SystemMonitor()
     let quotas = QuotaCoordinator()
+    let settings = StatusBarSettings()
     init() { monitor.start(); quotas.start() }
 }
 
@@ -873,25 +921,32 @@ final class AppState {
 struct StatusBarLabel: View {
     @ObservedObject var monitor: SystemMonitor
     @ObservedObject var quotas: QuotaCoordinator
+    @ObservedObject var settings: StatusBarSettings
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "cpu")
-                .foregroundStyle(monitor.cpuColor)
-            Text("\(Int(monitor.snapshot.cpuUsage * 100))%")
-                .foregroundStyle(monitor.cpuColor)
+            if settings.showCPU {
+                Image(systemName: "cpu")
+                    .foregroundStyle(monitor.cpuColor)
+                Text("\(Int(monitor.snapshot.cpuUsage * 100))%")
+                    .foregroundStyle(monitor.cpuColor)
+            }
 
-            Image(systemName: "memorychip")
-                .foregroundStyle(.secondary)
-            Text("\(Int(monitor.snapshot.memUsedGB))/\(Int(monitor.snapshot.memTotalGB))G")
-                .foregroundStyle(.secondary)
+            if settings.showMemory {
+                Image(systemName: "memorychip")
+                    .foregroundStyle(.secondary)
+                Text("\(Int(monitor.snapshot.memUsedGB))/\(Int(monitor.snapshot.memTotalGB))G")
+                    .foregroundStyle(.secondary)
+            }
 
-            Image(systemName: "internaldrive")
-                .foregroundStyle(.secondary)
-            Text("\(Int(monitor.snapshot.diskPct * 100))%")
-                .foregroundStyle(.secondary)
+            if settings.showDisk {
+                Image(systemName: "internaldrive")
+                    .foregroundStyle(.secondary)
+                Text("\(Int(monitor.snapshot.diskPct * 100))%")
+                    .foregroundStyle(.secondary)
+            }
 
-            if quotas.deepSeek.isAuthenticated {
+            if settings.showDeepSeek && quotas.deepSeek.isAuthenticated {
                 Image(systemName: "creditcard.fill")
                     .foregroundStyle(quotas.summaryColor)
                 Text(quotas.summary)
@@ -979,7 +1034,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = item.button else { return }
 
         let label = NSHostingView(rootView:
-            StatusBarLabel(monitor: state.monitor, quotas: state.quotas)
+            StatusBarLabel(monitor: state.monitor, quotas: state.quotas, settings: state.settings)
         )
         label.translatesAutoresizingMaskIntoConstraints = false
         button.addSubview(label)
@@ -1020,8 +1075,8 @@ struct SysMonBarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        // 真正的 UI 由 AppDelegate 用 NSStatusItem + NSPopover 搭建；
-        // 这里保留一个空 Settings 场景以满足 App 必须有 Scene 的要求。
-        Settings { EmptyView() }
+        Settings {
+            SettingsView(settings: appDelegate.state.settings)
+        }
     }
 }
