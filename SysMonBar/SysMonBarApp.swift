@@ -181,9 +181,12 @@ final class NetworkSampler: MetricReading {
                   (flags & UInt32(IFF_LOOPBACK)) == 0,
                   let data = p.pointee.ifa_data else { continue }
 
-            let nd = data.assumingMemoryBound(to: if_data.self).pointee
-            bytesIn  &+= UInt64(nd.ifi_ibytes)
-            bytesOut &+= UInt64(nd.ifi_obytes)
+            // 注：macOS 26+ 内核 getifaddrs 返回的是 if_data64（u_int64_t 字节计数器），
+            // 旧的 if_data (u_int32_t) 在 SDK 已废弃。读错结构体会拿到错偏移上的数据，
+            // 后续 Double(bytesIn - lastBytesIn) 会因为极大值触发 arithmetic overflow trap。
+            let nd = data.assumingMemoryBound(to: if_data64.self).pointee
+            bytesIn  &+= nd.ifi_ibytes
+            bytesOut &+= nd.ifi_obytes
         }
 
         let now = Date()
