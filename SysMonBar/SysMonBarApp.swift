@@ -7,8 +7,7 @@
 import SwiftUI
 import Combine
 import Darwin
-import WebKit
-import Security
+import SQLite3
 import os.log
 
 private let log = OSLog(subsystem: "com.theworld7.sysmonbar", category: "tick")
@@ -181,12 +180,9 @@ final class NetworkSampler: MetricReading {
                   (flags & UInt32(IFF_LOOPBACK)) == 0,
                   let data = p.pointee.ifa_data else { continue }
 
-            // 注：macOS 26+ 内核 getifaddrs 返回的是 if_data64（u_int64_t 字节计数器），
-            // 旧的 if_data (u_int32_t) 在 SDK 已废弃。读错结构体会拿到错偏移上的数据，
-            // 后续 Double(bytesIn - lastBytesIn) 会因为极大值触发 arithmetic overflow trap。
-            let nd = data.assumingMemoryBound(to: if_data64.self).pointee
-            bytesIn  &+= nd.ifi_ibytes
-            bytesOut &+= nd.ifi_obytes
+            let nd = data.assumingMemoryBound(to: if_data.self).pointee
+            bytesIn  &+= UInt64(nd.ifi_ibytes)
+            bytesOut &+= UInt64(nd.ifi_obytes)
         }
 
         let now = Date()
@@ -394,7 +390,7 @@ struct MenuContentView: View {
                 HStack {
                     Image(systemName: "network")
                         .foregroundStyle(.secondary)
-                        .frame(width: 36, alignment: .leading)
+                        .frame(width: 20, alignment: .leading)
                     Text("网络").frame(width: 36, alignment: .leading)
                     Text(String(format: "↓ %.1f KB/s ↑ %.1f KB/s",
                                 monitor.snapshot.netInKBps,
@@ -419,6 +415,7 @@ struct MenuContentView: View {
             }
         }
         .padding(14)
+        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private func metricRow(icon: String, title: String, pct: Double, detail: String) -> some View {
@@ -426,7 +423,7 @@ struct MenuContentView: View {
             HStack {
                 Image(systemName: icon)
                     .foregroundStyle(.secondary)
-                    .frame(width: 36, alignment: .leading)
+                    .frame(width: 20, alignment: .leading)
                 Text(title).frame(width: 36, alignment: .leading)
                 Text(detail).font(.system(.body, design: .monospaced))
                 Spacer()
@@ -445,54 +442,56 @@ struct MenuContentView: View {
 
     @ViewBuilder
     private var aiQuotaSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Image(systemName: "creditcard")
-                    .foregroundStyle(.secondary)
-                    .frame(width: 36, alignment: .leading)
-                Text("AI 余额").frame(width: 36, alignment: .leading)
-                if quotas.deepSeek.isAuthenticated {
-                    if let bal = quotas.deepSeek.balance {
-                        Text(verbatim: "\(quotas.deepSeek.currencySymbol)\(bal)")
-                            .font(.system(.body, design: .monospaced))
-                            .foregroundStyle(quotas.summaryColor)
-                    } else if quotas.deepSeek.isLoading {
-                        ProgressView().controlSize(.small)
+        HStack(alignment: .center) {
+            // 左：图标 + 名称 + 余额，更新时间 / 错误在下方
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Image(systemName: "creditcard")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20, alignment: .leading)
+                    Text("DeepSeek")
+                    if quotas.deepSeek.isAuthenticated {
+                        if let bal = quotas.deepSeek.balance {
+                            Text(verbatim: "\(quotas.deepSeek.currencySymbol)\(bal)")
+                                .font(.system(.body, design: .monospaced))
+                                .foregroundStyle(quotas.summaryColor)
+                                .fixedSize(horizontal: true, vertical: false)
+                        } else if quotas.deepSeek.isLoading {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("—").foregroundStyle(.secondary)
+                        }
                     } else {
-                        Text("—").foregroundStyle(.secondary)
+                        Text("未设置 Key").foregroundStyle(.secondary)
                     }
-                } else {
-                    Text("未登录").foregroundStyle(.secondary)
                 }
-                Spacer()
+                if let updated = quotas.deepSeek.lastUpdated {
+                    Text("更新于 \(updated.formatted(.relative(presentation: .named)))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if let err = quotas.deepSeek.lastError {
+                    Text(err)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
             }
-
-            if let updated = quotas.deepSeek.lastUpdated {
-                Text("更新于 \(updated.formatted(.relative(presentation: .named)))")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            if let err = quotas.deepSeek.lastError {
-                Text(err)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-            }
-
-            HStack(spacing: 8) {
+            Spacer()
+            // 右：刷新 / 退出登录（横向并排，靠右对齐）
+            HStack(spacing: 6) {
                 if quotas.deepSeek.isAuthenticated {
                     Button("刷新") {
                         Task { await quotas.deepSeek.refresh() }
                     }
                     .disabled(quotas.deepSeek.isLoading)
-                    Button("退出登录") {
+                    Button("修改 Key") {
                         quotas.deepSeek.signOut()
                     }
                 } else {
-                    Button("登录 DeepSeek") {
+                    Button("设置 API Key") {
                         Task { await quotas.deepSeek.signIn() }
                     }
                 }
-                Spacer()
             }
             .controlSize(.small)
         }
@@ -517,54 +516,171 @@ protocol ProviderQuota: ObservableObject {
     func signOut()
 }
 
-/// Keychain 存取 DeepSeek 登录 cookie（plain JSON 序列化，无 kSecAttrAccessible 限制）
-struct DeepSeekCookieStore {
-    let service = "com.theworld7.sysmonbar.deepseek"
-    let account = "session"
+// MARK: - SQLite 配置存储
 
-    func load() -> [HTTPCookie] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var item: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let props = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-        else { return [] }
-        return props.compactMap { dict -> HTTPCookie? in
-            var typed: [HTTPCookiePropertyKey: Any] = [:]
-            for (k, v) in dict {
-                typed[HTTPCookiePropertyKey(rawValue: k)] = v
-            }
-            return HTTPCookie(properties: typed)
+/// 通用 SQLite 键值存储（表 kv: key TEXT PRIMARY KEY, value TEXT）
+/// 数据库文件位于 ~/Library/Application Support/com.theworld7.sysmonbar/store.sqlite
+/// 每次调用都 open/close 连接，低频配置读写足够，无需担心线程安全。
+/// Swift 等价于 SQLITE_TRANSIENT_FN：C 宏 ((sqlite3_destructor_type)-1)，
+/// 告诉 SQLite 立即拷贝绑定的字符串，Swift String 可以安全释放。
+private let SQLITE_TRANSIENT_FN = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+struct SQLiteStore {
+    let dbURL: URL
+
+    init() {
+        let fm = FileManager.default
+        let base: URL
+        if let support = try? fm.url(for: .applicationSupportDirectory,
+                                      in: .userDomainMask,
+                                      appropriateFor: nil,
+                                      create: true) {
+            base = support
+        } else {
+            base = fm.temporaryDirectory  // 极端 fallback
         }
+        let dir = base.appendingPathComponent("com.theworld7.sysmonbar", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        self.dbURL = dir.appendingPathComponent("store.sqlite")
     }
 
-    func save(_ cookies: [HTTPCookie]) {
-        let payload = cookies.map { $0.properties ?? [:] }
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = data
-        SecItemAdd(add as CFDictionary, nil)
+    private func open() -> OpaquePointer? {
+        var db: OpaquePointer?
+        guard sqlite3_open(dbURL.path, &db) == SQLITE_OK, let db else { return nil }
+        // 建表（IF NOT EXISTS，幂等）
+        sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);",
+                     nil, nil, nil)
+        return db
+    }
+
+    func load(_ key: String) -> String? {
+        guard let db = open() else { return nil }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT value FROM kv WHERE key = ? LIMIT 1;",
+                                 -1, &stmt, nil) == SQLITE_OK else { return nil }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT_FN)
+        if sqlite3_step(stmt) == SQLITE_ROW, let cstr = sqlite3_column_text(stmt, 0) {
+            return String(cString: cstr)
+        }
+        return nil
+    }
+
+    func save(_ key: String, value: String) {
+        guard let db = open() else { return }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?);",
+                                 -1, &stmt, nil) == SQLITE_OK else { return }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT_FN)
+        sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT_FN)
+        sqlite3_step(stmt)
+    }
+
+    func delete(_ key: String) {
+        guard let db = open() else { return }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "DELETE FROM kv WHERE key = ?;",
+                                 -1, &stmt, nil) == SQLITE_OK else { return }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT_FN)
+        sqlite3_step(stmt)
+    }
+}
+
+/// DeepSeek API Key 持久化（SQLite 后端；API 与之前的 Keychain 版一致，
+/// 所以 DeepSeekProvider 完全不用改）
+struct DeepSeekAPIKeyStore {
+    private static let db = SQLiteStore()
+    private static let rowKey = "deepseek_api_key"
+
+    func load() -> String? {
+        Self.db.load(Self.rowKey)
+    }
+
+    func save(_ value: String) {
+        Self.db.save(Self.rowKey, value: value)
     }
 
     func clear() {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(query as CFDictionary)
+        Self.db.delete(Self.rowKey)
+    }
+}
+
+// MARK: - DeepSeek 官方余额 API
+
+/// 官方 GET https://api.deepseek.com/user/balance 的返回结构。
+/// 字段说明：is_available=余额是否足够调用；balance_infos 为各币种余额：
+/// total_balance=总可用余额（赠金+充值），granted_balance=未过期赠金，
+/// topped_up_balance=充值余额。
+struct DeepSeekBalance: Decodable {
+    let isAvailable: Bool
+    let balanceInfos: [BalanceInfo]
+
+    enum CodingKeys: String, CodingKey {
+        case isAvailable = "is_available"
+        case balanceInfos = "balance_infos"
+    }
+
+    struct BalanceInfo: Decodable {
+        let currency: String
+        let totalBalance: Decimal
+        let grantedBalance: Decimal
+        let toppedUpBalance: Decimal
+
+        enum CodingKeys: String, CodingKey {
+            case currency
+            case totalBalance = "total_balance"
+            case grantedBalance = "granted_balance"
+            case toppedUpBalance = "topped_up_balance"
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            currency = try c.decode(String.self, forKey: .currency)
+            totalBalance = try c.flexibleDecimal(forKey: .totalBalance)
+            grantedBalance = try c.flexibleDecimal(forKey: .grantedBalance)
+            toppedUpBalance = try c.flexibleDecimal(forKey: .toppedUpBalance)
+        }
+    }
+}
+
+private extension KeyedDecodingContainer {
+    /// 兼容 API 用字符串（"110.00"）或数字（110.0）返回金额。
+    func flexibleDecimal(forKey key: Key) throws -> Decimal {
+        if let s = try? decode(String.self, forKey: key),
+           let d = Decimal(string: s) {
+            return d
+        }
+        return try decode(Decimal.self, forKey: key)
+    }
+}
+
+@MainActor
+enum DeepSeekAPIKeyInput {
+    /// 弹窗输入 DeepSeek API Key，回调传入清洗后的字符串。
+    static func present(onSubmit: @escaping (String?) -> Void) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "设置 DeepSeek API Key"
+        alert.informativeText = "在 platform.deepseek.com 的 \"API Keys\" 页面生成密钥。余额将通过官方 /user/balance 接口查询。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "sk-..."
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        let response = alert.runModal()
+        let key = response == .alertFirstButtonReturn
+            ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            : nil
+        onSubmit(key)
     }
 }
 
@@ -572,25 +688,40 @@ struct DeepSeekCookieStore {
 final class DeepSeekProvider: ObservableObject, ProviderQuota {
     let name = "DeepSeek"
     let displayName = "DeepSeek"
-    let currencySymbol = "¥"
+    var currencySymbol: String { currency == "USD" ? "$" : "¥" }
+    @Published private(set) var currency = "CNY"
 
     @Published private(set) var balance: Decimal?
+    @Published private(set) var isAvailable = false
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var isAuthenticated = false
     @Published private(set) var lastError: String?
     @Published private(set) var isLoading = false
 
-    private let store = DeepSeekCookieStore()
+    /// 内存中的 API Key 缓存，避免每次 refresh 都访问 Keychain
+    private var cachedAPIKey: String?
+    private let store = DeepSeekAPIKeyStore()
     private var timer: Timer?
     private let refreshInterval: TimeInterval = 300  // 5 分钟
-    private let balanceURL = URL(string: "https://platform.deepseek.com/usage")!
+    private let apiURL = URL(string: "https://api.deepseek.com/user/balance")!
 
     init() {
-        let cached = store.load()
-        isAuthenticated = !cached.isEmpty
+        // 注：不要在这里设 isAuthenticated。SwiftUI App.init() 返回后 SwiftUI 才订阅
+        // objectWillChange，init 里的 @Published 赋值不会被观测到。
+        // 初始状态同步在 start() 里做（那时 SwiftUI 已订阅）。
+    }
+
+    /// 从 Keychain 重新读取 API Key 状态，同步给 SwiftUI。
+    /// 必须在 start() 里调用，因为 SwiftUI 在 init 完成后才订阅 ObservableObject。
+    private func syncAuthFromStore() {
+        let key = store.load()
+        cachedAPIKey = key
+        let has = key?.isEmpty == false
+        if isAuthenticated != has { isAuthenticated = has }
     }
 
     func start() {
+        syncAuthFromStore()
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in await self?.refresh() }
@@ -604,25 +735,28 @@ final class DeepSeekProvider: ObservableObject, ProviderQuota {
     }
 
     func refresh() async {
-        guard isAuthenticated else { return }
+        // 不再 guard isAuthenticated：只要 Keychain 里有 API Key 就尝试拉数据，
+        // 拉不到（401/网络错误）再清状态。这样首次启动也能恢复已登录态。
         isLoading = true
         defer { isLoading = false }
 
-        let cookies = store.load()
-        guard !cookies.isEmpty else {
-            isAuthenticated = false
-            lastError = "登录信息丢失，请重新登录"
+        let key: String
+        if let cached = cachedAPIKey, !cached.isEmpty {
+            key = cached
+        } else if let loaded = store.load(), !loaded.isEmpty {
+            cachedAPIKey = loaded
+            key = loaded
+        } else {
+            if isAuthenticated { isAuthenticated = false }
+            lastError = "未设置 API Key，请先设置密钥"
             return
         }
+        if !isAuthenticated { isAuthenticated = true }
 
-        var req = URLRequest(url: balanceURL)
-        req.setValue(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15",
-            forHTTPHeaderField: "User-Agent"
-        )
-        req.setValue("text/html,application/xhtml+xml", forHTTPHeaderField: "Accept")
-        let fields = HTTPCookie.requestHeaderFields(with: cookies)
-        for (k, v) in fields { req.setValue(v, forHTTPHeaderField: k) }
+        var req = URLRequest(url: apiURL)
+        req.httpMethod = "GET"
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: req)
@@ -630,17 +764,10 @@ final class DeepSeekProvider: ObservableObject, ProviderQuota {
                 lastError = "无效响应"
                 return
             }
-            // 401/403 或重定向到登录 → cookie 失效
-            if http.statusCode == 401 || http.statusCode == 403 {
+            // 401 → API Key 无效或已被吊销
+            if http.statusCode == 401 {
                 isAuthenticated = false
-                lastError = "登录已过期，请重新登录"
-                store.clear()
-                return
-            }
-            if let loc = http.value(forHTTPHeaderField: "Location"),
-               loc.lowercased().contains("login") || loc.lowercased().contains("sign-in") {
-                isAuthenticated = false
-                lastError = "登录已过期，请重新登录"
+                lastError = "API Key 无效，请重新设置"
                 store.clear()
                 return
             }
@@ -649,23 +776,34 @@ final class DeepSeekProvider: ObservableObject, ProviderQuota {
                 return
             }
 
-            let html = String(data: data, encoding: .utf8) ?? ""
-            guard let amount = parseBalance(from: html) else {
-                lastError = "解析余额失败（页面结构可能已变更）"
-                return
+            do {
+                let payload = try JSONDecoder().decode(DeepSeekBalance.self, from: data)
+                guard !payload.balanceInfos.isEmpty else {
+                    lastError = "未返回余额信息"
+                    return
+                }
+                // 优先人民币（CNY）币种，找不到再取第一条。
+                let info = payload.balanceInfos.first { $0.currency.contains("CNY") }
+                    ?? payload.balanceInfos[0]
+                // 展示总可用余额（赠金 + 充值）。如需只看充值，改用 toppedUpBalance。
+                currency = info.currency
+                balance = info.totalBalance
+                isAvailable = payload.isAvailable
+                lastUpdated = Date()
+                lastError = nil
+            } catch {
+                lastError = "解析余额失败：\(error.localizedDescription)"
             }
-            balance = amount
-            lastUpdated = Date()
-            lastError = nil
         } catch {
             lastError = error.localizedDescription
         }
     }
 
     func signIn() async {
-        DeepSeekSignInWindow.present { [weak self] cookies in
-            guard let self else { return }
-            self.store.save(cookies)
+        DeepSeekAPIKeyInput.present { [weak self] key in
+            guard let self, let key, !key.isEmpty else { return }
+            self.store.save(key)
+            self.cachedAPIKey = key
             self.isAuthenticated = true
             self.lastError = nil
             Task { await self.refresh() }
@@ -674,129 +812,13 @@ final class DeepSeekProvider: ObservableObject, ProviderQuota {
 
     func signOut() {
         store.clear()
+        cachedAPIKey = nil
         isAuthenticated = false
         balance = nil
+        isAvailable = false
+        currency = "CNY"
         lastUpdated = nil
         lastError = nil
-    }
-
-    /// 从 DeepSeek `/usage` 页面 HTML 里解析「充值余额」金额。
-    ///
-    /// 页面结构（2025-09 采样）：
-    ///   <div data-usage-layout-card="true">
-    ///     <span>充值余额</span>          <!-- 卡片标题 -->
-    ///     ...
-    ///     <span data-usage-layout-font="value">¥6.00</span>
-    ///     <span data-usage-layout-font="unit">CNY</span>
-    ///   </div>
-    ///
-    /// 锚点选择：class 名是 styled-components 风格的 hash（不稳定），
-    /// 但 `data-usage-layout-*` 属性和中文标签文本是稳定 API。
-    ///
-    /// 策略：先定位「充值余额」文本，从它向前找最近的 card 边界，
-    /// 再在 card 范围内找 value span，提取数字。
-    func parseBalance(from html: String) -> Decimal? {
-        guard let labelRange = html.range(of: "充值余额") else { return nil }
-        let beforeLabel = html[..<labelRange.lowerBound]
-
-        // 向前找最近的 card 边界
-        guard let cardAttrRange = beforeLabel.range(
-            of: "data-usage-layout-card=\"true\"",
-            options: .backwards
-        ) else { return nil }
-
-        // 从 card 开始到 HTML 末尾，取第一个 value span
-        let cardRegion = html[cardAttrRange.lowerBound...]
-        guard let valueAttrRange = cardRegion.range(
-            of: "data-usage-layout-font=\"value\""
-        ) else { return nil }
-
-        // value span 起始标签结束位置之后的文本即为金额
-        let afterValueAttr = cardRegion[valueAttrRange.upperBound...]
-        guard let openTagEnd = afterValueAttr.range(of: ">") else { return nil }
-        let afterOpenTag = afterValueAttr[openTagEnd.upperBound...]
-        guard let closeTag = afterOpenTag.range(of: "</span>") else { return nil }
-
-        let raw = String(afterOpenTag[..<closeTag.lowerBound])
-            .replacingOccurrences(of: "¥", with: "")
-            .replacingOccurrences(of: ",", with: "")
-            .trimmingCharacters(in: .whitespaces)
-
-        return Decimal(string: raw)
-    }
-}
-
-/// WKWebView 内嵌登录窗口，登录成功（URL 离开登录域 + 拿到 session cookie）后回调
-final class DeepSeekSignInWindow: NSWindowController, WKNavigationDelegate {
-    private var webView: WKWebView!
-    private let onSuccess: ([HTTPCookie]) -> Void
-    private var completed = false
-
-    private init(onSuccess: @escaping ([HTTPCookie]) -> Void) {
-        self.onSuccess = onSuccess
-
-        let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = .default()
-
-        let webView = WKWebView(
-            frame: NSRect(x: 0, y: 0, width: 520, height: 680),
-            configuration: cfg
-        )
-        self.webView = webView
-
-        let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 680),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        win.title = "登录 DeepSeek"
-        win.contentView = webView
-        win.center()
-        win.isReleasedWhenClosed = false
-
-        super.init(window: win)
-        webView.navigationDelegate = self
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
-
-    @MainActor
-    static func present(onSuccess: @escaping ([HTTPCookie]) -> Void) {
-        let ctrl = DeepSeekSignInWindow(onSuccess: onSuccess)
-        ctrl.showWindow(nil)
-        ctrl.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        if let url = URL(string: "https://platform.deepseek.com/login") {
-            ctrl.webView.load(URLRequest(url: url))
-        }
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard !completed, let url = webView.url else { return }
-        let path = url.path.lowercased()
-        let host = url.host?.lowercased() ?? ""
-
-        guard host.contains("deepseek.com") else { return }
-        if path.contains("/login") || path.contains("/sign-in") { return }
-
-        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { [weak self] cookies in
-            guard let self, !self.completed else { return }
-            let dsCookies = cookies.filter { $0.domain.contains("deepseek.com") }
-            guard !dsCookies.isEmpty else { return }
-            // 保险：必须有 session/token/user/auth 命名的 cookie 才算登录成功
-            let hasSession = dsCookies.contains { c in
-                let n = c.name.lowercased()
-                return n.contains("session") || n.contains("token") || n.contains("user") || n.contains("auth")
-            }
-            guard hasSession else { return }
-
-            DispatchQueue.main.async {
-                self.completed = true
-                self.close()
-                self.onSuccess(dsCookies)
-            }
-        }
     }
 }
 
@@ -844,9 +866,9 @@ struct SysMonBarApp: App {
     @StateObject private var quotas: QuotaCoordinator
 
     init() {
-        // 双保险：除了 LSUIElement，运行时再设一次 accessory 激活策略
-        // 防止 macOS Sonoma+ 在某些场景下把它当 regular app 处理
-        NSApp.setActivationPolicy(.accessory)
+        // LSUIElement=true 已在 Info.plist 设置，SwiftUI 会自动用 accessory 激活策略。
+        // 不在这里调 NSApp.setActivationPolicy(.accessory)：在 SwiftUI App.init() 里
+        // NSApp 全局变量可能还是 nil（macOS 27 SDK 行为变了），访问会 force unwrap crash。
         let m = SystemMonitor()
         m.start()
         let q = QuotaCoordinator()
@@ -870,7 +892,7 @@ struct SysMonBarApp: App {
             MenuContentView()
                 .environmentObject(monitor)
                 .environmentObject(quotas)
-                .frame(width: 300)
+                .frame(width: 360)
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "cpu")
