@@ -480,7 +480,7 @@ struct MenuContentView: View {
                         if provider.isAuthenticated, let bal = provider.balance {
                             Text(verbatim: provider.formatted(bal))
                                 .font(.system(.body, design: .monospaced))
-                                .foregroundStyle(provider.summaryColor)
+                                .foregroundStyle(provider.summaryColor(threshold: settings.warningThreshold(for: provider)))
                                 .fixedSize(horizontal: true, vertical: false)
                         } else if provider.isLoading {
                             ProgressView().controlSize(.small)
@@ -503,7 +503,7 @@ struct MenuContentView: View {
                         }
                         ProgressView(value: seg.percent)
                             .progressViewStyle(.linear)
-                            .tint(seg.percent > 0.5 ? Color.green : (seg.percent > 0.2 ? Color.orange : Color.red))
+                            .tint(seg.percent > 0.5 ? Color.red : (seg.percent > 0.2 ? Color.orange : Color.green))
                     }
                 }
                 // 无进度条时才显示副余额文本
@@ -554,7 +554,8 @@ protocol ProviderQuota: ObservableObject {
     var isAuthenticated: Bool { get }
     var lastError: String? { get }
     var isLoading: Bool { get }
-    var summaryColor: Color { get }
+    /// 弹窗主文本颜色（绿/橙/红三档），橙→红边界由调用方传入的"预警阈值"决定
+    func summaryColor(threshold: Double) -> Color
     /// 进度条分段（默认空；MiniMax 暴露 5h/周两条）
     var progressSegments: [ProviderProgressSegment] { get }
     func start()
@@ -562,7 +563,7 @@ protocol ProviderQuota: ObservableObject {
     func refresh() async
     func signIn() async
     func signOut()
-    /// 余额格式化（默认符号在前如 ¥110；MiniMax 覆盖为符号在后如 13%）
+    /// 余额格式化（默认符号在前如 ¥110；MiniMax 覆盖为符号在后如 87%）
     func formatted(_ amount: Decimal) -> String
 }
 
@@ -656,6 +657,15 @@ struct SQLiteStore {
     func setBool(_ key: String, _ value: Bool) {
         save(key, value: value ? "1" : "0")
     }
+
+    func getDouble(_ key: String, default defaultValue: Double) -> Double {
+        guard let s = load(key) else { return defaultValue }
+        return Double(s) ?? defaultValue
+    }
+
+    func setDouble(_ key: String, _ value: Double) {
+        save(key, value: String(value))
+    }
 }
 
 /// DeepSeek API Key 持久化（SQLite 后端）
@@ -748,8 +758,8 @@ struct MiniMaxBalance: Decodable {
     }
 
     struct ModelRemain: Decodable {
-        let currentIntervalRemainingPercent: Int   // 5h 已使用百分比 0-100（接口实为已用额度）
-        let currentWeeklyRemainingPercent: Int     // 周已使用百分比 0-100
+        let currentIntervalRemainingPercent: Int   // 5h 剩余百分比 0-100（API 字段名准确，详见 docs/adr/0001）
+        let currentWeeklyRemainingPercent: Int     // 周剩余百分比 0-100
         let modelName: String?
 
         enum CodingKeys: String, CodingKey {
@@ -809,12 +819,12 @@ final class DeepSeekProvider: ObservableObject, ProviderQuota {
     var currencySymbol: String { currency == "USD" ? "$" : "¥" }
     @Published private(set) var currency = "CNY"
 
-    /// >¥100 绿、¥20–100 橙、<¥20 红
-    var summaryColor: Color {
+    /// >100 绿、`threshold < n ≤ 100` 橙、`n ≤ threshold` 红；threshold 为"预警阈值"，单位 CNY
+    func summaryColor(threshold: Double) -> Color {
         guard let bal = balance else { return .secondary }
         let n = NSDecimalNumber(decimal: bal).doubleValue
         if n > 100 { return .green }
-        if n > 20 { return .orange }
+        if n > threshold { return .orange }
         return .red
     }
 
@@ -973,31 +983,31 @@ final class MiniMaxProvider: ObservableObject, ProviderQuota {
     let icon = "bolt"
     let currencySymbol = "%"
 
-    /// 剩余百分比：>50 绿、>20 橙、其余红
-    var summaryColor: Color {
+    /// 已使用百分比：<50 绿、`50 ≤ n < threshold` 橙、`n ≥ threshold` 红；threshold 为"预警阈值"
+    func summaryColor(threshold: Double) -> Color {
         guard let bal = balance else { return .secondary }
         let n = NSDecimalNumber(decimal: bal).doubleValue
-        if n > 50 { return .green }
-        if n > 20 { return .orange }
+        if n < 50 { return .green }
+        if n < threshold { return .orange }
         return .red
     }
 
-    /// 百分比符号在后：「13%」
+    /// 百分比符号在后：「87%」
     func formatted(_ amount: Decimal) -> String {
         "\(amount)\(currencySymbol)"
     }
 
-    /// 5h / 周剩余百分比的进度条（接口返回已用额度，这里换算成剩余显示）
+    /// 5h / 周已使用百分比的进度条
     var progressSegments: [ProviderProgressSegment] {
         guard let b5h = balance, let bw = secondaryBalance else { return [] }
         return [
-            ProviderProgressSegment(label: "5h 剩余", percent: NSDecimalNumber(decimal: b5h).doubleValue / 100.0),
-            ProviderProgressSegment(label: "周剩余", percent: NSDecimalNumber(decimal: bw).doubleValue / 100.0),
+            ProviderProgressSegment(label: "5h 使用", percent: NSDecimalNumber(decimal: b5h).doubleValue / 100.0),
+            ProviderProgressSegment(label: "周使用", percent: NSDecimalNumber(decimal: bw).doubleValue / 100.0),
         ]
     }
 
     @Published private(set) var balance: Decimal?
-    /// 周剩余百分比（副余额）
+    /// 周已使用百分比（副余额）
     @Published private(set) var weeklyBalance: Decimal?
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var isAuthenticated = false
@@ -1079,7 +1089,8 @@ final class MiniMaxProvider: ObservableObject, ProviderQuota {
                     lastError = "API: \(payload.baseResp.statusMsg)"
                     return
                 }
-                // 接口返回的是已使用额度，换算成剩余额度显示（100 - 已用）
+                // 接口字段是 remaining_percent（剩余 %），换算成已使用 %（100 - remaining）后用于显示与预警判断
+                // 详见 docs/adr/0001
                 balance = payload.modelRemains.first.map { Decimal(100 - $0.currentIntervalRemainingPercent) } ?? 0
                 weeklyBalance = payload.modelRemains.first.map { Decimal(100 - $0.currentWeeklyRemainingPercent) } ?? 0
                 lastUpdated = Date()
@@ -1092,7 +1103,7 @@ final class MiniMaxProvider: ObservableObject, ProviderQuota {
         }
     }
 
-    /// 周剩余百分比作为副余额展示
+    /// 周已使用百分比作为副余额展示
     var secondaryBalance: Decimal? { weeklyBalance }
 
     func signIn() async {
@@ -1166,9 +1177,6 @@ final class QuotaCoordinator: ObservableObject {
         guard let bal = deepSeek.balance else { return "—" }
         return "\(deepSeek.currencySymbol)\(bal)"
     }
-
-    /// 菜单栏用的颜色（兼容旧引用，委托给 deepSeek）
-    var summaryColor: Color { deepSeek.summaryColor }
 }
 
 // MARK: - App 入口
@@ -1185,6 +1193,9 @@ final class StatusBarSettings: ObservableObject {
     // 仅控制状态栏 label 的显隐（总控关闭时保留但失效）
     @Published var showDeepSeek: Bool { didSet { store.setBool("statusbar.show_deepseek", showDeepSeek) } }
     @Published var showMiniMax: Bool  { didSet { store.setBool("statusbar.show_minimax", showMiniMax) } }
+    // 余额预警阈值（仅作用于弹窗 summaryColor，不影响状态栏 / segments）
+    @Published var deepSeekWarningThreshold: Double { didSet { store.setDouble("ai.deepseek_warning_threshold", deepSeekWarningThreshold) } }
+    @Published var miniMaxWarningThreshold: Double  { didSet { store.setDouble("ai.minimax_warning_threshold", miniMaxWarningThreshold) } }
 
     // 派生：状态栏最终显隐 = 总控 && 设置
     var statusBarShowsDeepSeek: Bool { deepSeekEnabled && showDeepSeek }
@@ -1202,6 +1213,15 @@ final class StatusBarSettings: ObservableObject {
         showDisk     = store.getBool("statusbar.show_disk", default: true)
         showDeepSeek = store.getBool("statusbar.show_deepseek", default: true)
         showMiniMax  = store.getBool("statusbar.show_minimax", default: true)
+        deepSeekWarningThreshold = store.getDouble("ai.deepseek_warning_threshold", default: 5)
+        miniMaxWarningThreshold  = store.getDouble("ai.minimax_warning_threshold", default: 80)
+    }
+
+    /// provider 对应的预警阈值（DeepSeek=剩余 CNY 下限；MiniMax=已使用 % 上限）
+    func warningThreshold(for provider: any ProviderQuota) -> Double {
+        if provider is DeepSeekProvider { return deepSeekWarningThreshold }
+        if provider is MiniMaxProvider  { return miniMaxWarningThreshold }
+        return 0
     }
 }
 
@@ -1229,7 +1249,7 @@ struct SettingsView: View {
 }
 
 /// AI Provider 配置面板（独立窗口）：每个厂商一行（名称 + Switch 开关），
-/// 打开后展示 API Key 输入框。关闭开关只隐藏展示，不删除已保存的 Key。
+/// 打开后展示 API Key + 预警阈值输入框。关闭开关只隐藏展示，不删除已保存的 Key。
 /// 通过“保存/取消”统一提交，避免边改边生效。
 struct AIProviderConfigView: View {
     let settings: StatusBarSettings
@@ -1241,6 +1261,8 @@ struct AIProviderConfigView: View {
     @State private var mmEnabled: Bool
     @State private var dsKey: String
     @State private var mmKey: String
+    @State private var dsThresholdText: String
+    @State private var mmThresholdText: String
 
     init(
         settings: StatusBarSettings,
@@ -1258,6 +1280,8 @@ struct AIProviderConfigView: View {
         _mmEnabled = State(initialValue: settings.miniMaxEnabled)
         _dsKey = State(initialValue: deepSeek.storedAPIKey ?? "")
         _mmKey = State(initialValue: miniMax.storedAPIKey ?? "")
+        _dsThresholdText = State(initialValue: Self.format(settings.deepSeekWarningThreshold))
+        _mmThresholdText = State(initialValue: Self.format(settings.miniMaxWarningThreshold))
     }
 
     var body: some View {
@@ -1266,12 +1290,16 @@ struct AIProviderConfigView: View {
                 .font(.headline)
 
             providerRow(title: "DeepSeek", enabled: $dsEnabled, key: $dsKey,
-                        placeholder: "DeepSeek API Key (sk-...)")
+                        threshold: $dsThresholdText,
+                        placeholder: "DeepSeek API Key (sk-...)",
+                        thresholdPlaceholder: "预警阈值 (¥) — 余额 ≤ 此值时弹窗变红")
 
             Divider()
 
             providerRow(title: "MiniMax", enabled: $mmEnabled, key: $mmKey,
-                        placeholder: "MiniMax API Key (sk-...)")
+                        threshold: $mmThresholdText,
+                        placeholder: "MiniMax API Key (sk-...)",
+                        thresholdPlaceholder: "预警阈值 (%) — 已使用 ≥ 此值时弹窗变红")
 
             Divider()
 
@@ -1293,7 +1321,9 @@ struct AIProviderConfigView: View {
         title: String,
         enabled: Binding<Bool>,
         key: Binding<String>,
-        placeholder: String
+        threshold: Binding<String>,
+        placeholder: String,
+        thresholdPlaceholder: String
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -1307,11 +1337,19 @@ struct AIProviderConfigView: View {
                 TextField(placeholder, text: key)
                     .textFieldStyle(.roundedBorder)
                     .controlSize(.small)
+                TextField(thresholdPlaceholder, text: threshold)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
             }
         }
     }
 
+    private static func format(_ value: Double) -> String {
+        value == value.rounded() ? String(Int(value)) : String(value)
+    }
+
     /// 统一提交：写入 AI 配置总控开关 + 保存各厂商 Key（仅对打开的厂商写入）
+    /// + 写入预警阈值（解析失败则保留原设置值）。
     /// 注意：总控优先级高于设置中的状态栏显隐，这里不写 showDeepSeek/showMiniMax
     private func apply() {
         settings.deepSeekEnabled = dsEnabled
@@ -1323,6 +1361,12 @@ struct AIProviderConfigView: View {
         if mmEnabled {
             let mk = mmKey.trimmingCharacters(in: .whitespacesAndNewlines)
             if !mk.isEmpty { miniMax.saveAPIKey(mk) }
+        }
+        if let v = Double(dsThresholdText), v > 0 {
+            settings.deepSeekWarningThreshold = v
+        }
+        if let v = Double(mmThresholdText), v > 0 {
+            settings.miniMaxWarningThreshold = v
         }
     }
 }
