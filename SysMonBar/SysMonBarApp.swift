@@ -403,22 +403,30 @@ struct MenuContentView: View {
                     .frame(height: 48)
             }
 
-            Divider()
+            // AI 区：仅受 AI 配置总控控制，两个厂商都关时整体隐藏
+            if settings.aiPanelVisible {
+                Divider()
 
-            // AI Provider：开关关闭的厂商不展示
-            if settings.showDeepSeek {
-                aiQuotaSection
-            }
-            if settings.showMiniMax {
-                miniMaxSection
-            }
-            // 统一的刷新 + 配置（刷新两个厂商；配置打开 AI Provider 面板）
-            HStack(spacing: 6) {
-                Button("刷新") { Task { await quotas.refreshAll() } }
+                // AI Provider：总控关闭的厂商不展示
+                if settings.deepSeekEnabled {
+                    aiQuotaSection
+                }
+                if settings.miniMaxEnabled {
+                    miniMaxSection
+                }
+                // 统一的刷新 + 配置（只刷新总控已启用的厂商；配置打开 AI Provider 面板）
+                HStack(spacing: 6) {
+                    Button("刷新") {
+                        Task {
+                            if settings.deepSeekEnabled { await quotas.deepSeek.refresh() }
+                            if settings.miniMaxEnabled { await quotas.miniMax.refresh() }
+                        }
+                    }
                     .disabled(quotas.isLoading)
-                Button("配置") { NotificationCenter.default.post(name: .showAIProviderConfig, object: nil) }
+                    Button("配置") { NotificationCenter.default.post(name: .showAIProviderConfig, object: nil) }
+                }
+                .controlSize(.small)
             }
-            .controlSize(.small)
 
             Divider()
             HStack {
@@ -1153,12 +1161,6 @@ final class QuotaCoordinator: ObservableObject {
         providers.contains { $0.isLoading }
     }
 
-    /// 一次刷新所有厂商（DeepSeek + MiniMax）
-    func refreshAll() async {
-        await deepSeek.refresh()
-        await miniMax.refresh()
-    }
-
     /// 菜单栏展示用的简短文本（已登录且有余额时才有意义）
     var summary: String {
         guard let bal = deepSeek.balance else { return "—" }
@@ -1174,15 +1176,27 @@ final class QuotaCoordinator: ObservableObject {
 // 共享全局状态：App 与 AppDelegate 都需要访问 monitor / quotas
 @MainActor
 final class StatusBarSettings: ObservableObject {
+    // AI 配置总控（AIProviderConfigView 面板写入，优先级最高；关闭时设置中的显隐失效）
+    @Published var deepSeekEnabled: Bool { didSet { store.setBool("ai.deepseek_enabled", deepSeekEnabled) } }
+    @Published var miniMaxEnabled: Bool  { didSet { store.setBool("ai.minimax_enabled", miniMaxEnabled) } }
     @Published var showCPU: Bool      { didSet { store.setBool("statusbar.show_cpu", showCPU) } }
     @Published var showMemory: Bool   { didSet { store.setBool("statusbar.show_memory", showMemory) } }
     @Published var showDisk: Bool     { didSet { store.setBool("statusbar.show_disk", showDisk) } }
+    // 仅控制状态栏 label 的显隐（总控关闭时保留但失效）
     @Published var showDeepSeek: Bool { didSet { store.setBool("statusbar.show_deepseek", showDeepSeek) } }
     @Published var showMiniMax: Bool  { didSet { store.setBool("statusbar.show_minimax", showMiniMax) } }
+
+    // 派生：状态栏最终显隐 = 总控 && 设置
+    var statusBarShowsDeepSeek: Bool { deepSeekEnabled && showDeepSeek }
+    var statusBarShowsMiniMax: Bool  { miniMaxEnabled && showMiniMax }
+    // 弹窗面板 AI 区：仅受总控控制
+    var aiPanelVisible: Bool { deepSeekEnabled || miniMaxEnabled }
 
     private let store = SQLiteStore()
 
     init() {
+        deepSeekEnabled = store.getBool("ai.deepseek_enabled", default: true)
+        miniMaxEnabled  = store.getBool("ai.minimax_enabled", default: true)
         showCPU      = store.getBool("statusbar.show_cpu", default: true)
         showMemory   = store.getBool("statusbar.show_memory", default: true)
         showDisk     = store.getBool("statusbar.show_disk", default: true)
@@ -1196,12 +1210,16 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Section("状态栏显示项") {
+            Section {
                 Toggle("CPU 使用率", isOn: $settings.showCPU)
                 Toggle("内存", isOn: $settings.showMemory)
                 Toggle("磁盘", isOn: $settings.showDisk)
                 Toggle("DeepSeek 余额", isOn: $settings.showDeepSeek)
+                    .disabled(!settings.deepSeekEnabled)
                 Toggle("MiniMax 余额", isOn: $settings.showMiniMax)
+                    .disabled(!settings.miniMaxEnabled)
+            } footer: {
+                Text("DeepSeek / MiniMax 的总开关在「AI Provider 配置」面板中；此处仅控制状态栏是否显示对应余额，总控关闭时这些开关不可用。")
             }
         }
         .formStyle(.grouped)
@@ -1236,8 +1254,8 @@ struct AIProviderConfigView: View {
         self.miniMax = miniMax
         self.onSave = onSave
         self.onCancel = onCancel
-        _dsEnabled = State(initialValue: settings.showDeepSeek)
-        _mmEnabled = State(initialValue: settings.showMiniMax)
+        _dsEnabled = State(initialValue: settings.deepSeekEnabled)
+        _mmEnabled = State(initialValue: settings.miniMaxEnabled)
         _dsKey = State(initialValue: deepSeek.storedAPIKey ?? "")
         _mmKey = State(initialValue: miniMax.storedAPIKey ?? "")
     }
@@ -1293,10 +1311,11 @@ struct AIProviderConfigView: View {
         }
     }
 
-    /// 统一提交：应用到显示开关 + 保存各厂商 Key（仅对打开的厂商写入）
+    /// 统一提交：写入 AI 配置总控开关 + 保存各厂商 Key（仅对打开的厂商写入）
+    /// 注意：总控优先级高于设置中的状态栏显隐，这里不写 showDeepSeek/showMiniMax
     private func apply() {
-        settings.showDeepSeek = dsEnabled
-        settings.showMiniMax = mmEnabled
+        settings.deepSeekEnabled = dsEnabled
+        settings.miniMaxEnabled = mmEnabled
         if dsEnabled {
             let dk = dsKey.trimmingCharacters(in: .whitespacesAndNewlines)
             if !dk.isEmpty { deepSeek.saveAPIKey(dk) }
@@ -1313,7 +1332,9 @@ final class AppState {
     let monitor = SystemMonitor()
     let quotas = QuotaCoordinator()
     let settings = StatusBarSettings()
-    init() { monitor.start(); quotas.start() }
+    // quotas 的 start/stop 由 AppDelegate 中对 AI 配置总控的订阅驱动，
+    // 总控关闭的厂商不再后台轮询 API
+    init() { monitor.start() }
 }
 
 // 状态栏标签（原 MenuBarExtra label 抽出，方便 NSHostingView 托管）
@@ -1345,18 +1366,20 @@ struct StatusBarLabel: View {
                     .foregroundStyle(.secondary)
             }
 
-            if settings.showDeepSeek && quotas.deepSeek.isAuthenticated, let bal = quotas.deepSeek.balance {
+            // AI 余额在状态栏用 .secondary 与内存/磁盘样式一致（红色在菜单栏背景辨识度差）；
+            // 彩色分级仅保留在弹窗面板中
+            if settings.statusBarShowsDeepSeek && quotas.deepSeek.isAuthenticated, let bal = quotas.deepSeek.balance {
                 Image(systemName: quotas.deepSeek.icon + ".fill")
-                    .foregroundStyle(quotas.deepSeek.summaryColor)
+                    .foregroundStyle(.secondary)
                 Text(quotas.deepSeek.formatted(bal))
-                    .foregroundStyle(quotas.deepSeek.summaryColor)
+                    .foregroundStyle(.secondary)
             }
 
-            if settings.showMiniMax && quotas.miniMax.isAuthenticated, let bal = quotas.miniMax.balance {
+            if settings.statusBarShowsMiniMax && quotas.miniMax.isAuthenticated, let bal = quotas.miniMax.balance {
                 Image(systemName: quotas.miniMax.icon + ".fill")
-                    .foregroundStyle(quotas.miniMax.summaryColor)
+                    .foregroundStyle(.secondary)
                 Text(quotas.miniMax.formatted(bal))
-                    .foregroundStyle(quotas.miniMax.summaryColor)
+                    .foregroundStyle(.secondary)
             }
         }
         .font(.system(size: 11, weight: .medium))
@@ -1430,12 +1453,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
     private var configWindow: NSWindow?
+    private var settingsCancellable: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         os_log("app did finish launching", log: log, type: .info)
         NotificationCenter.default.addObserver(self, selector: #selector(handleShowProviderConfig(_:)),
                                                name: .showAIProviderConfig, object: nil)
         setupStatusItemAndPopover()
+
+        // AI 配置总控驱动厂商轮询启停：订阅 @Published（发射发生在值变化之后），
+        // 订阅时立即发射当前值，等效于启动时只 start 已启用的厂商
+        settingsCancellable = state.settings.$deepSeekEnabled
+            .combineLatest(state.settings.$miniMaxEnabled)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] ds, mm in
+                guard let self else { return }
+                if ds { self.state.quotas.deepSeek.start() } else { self.state.quotas.deepSeek.stop() }
+                if mm { self.state.quotas.miniMax.start() } else { self.state.quotas.miniMax.stop() }
+            }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1481,7 +1516,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if pop.isShown {
             pop.performClose(sender)
         } else {
+            // 弹窗内容窗口是 nonactivating panel：点击状态栏时应用可能未激活，
+            // 不激活则弹窗无法成为 key window，键盘焦点不会落在面板上（需额外点击）
+            NSApp.activate(ignoringOtherApps: true)
             pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // show 后显式 makeKey，保证每次展开都稳定聚焦（连续开合行为一致）；
+            // 面板内部控件的焦点切换仍由 SwiftUI focusState/自身 firstResponder 接管，不受影响
+            pop.contentViewController?.view.window?.makeKey()
         }
     }
 
